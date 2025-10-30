@@ -5113,6 +5113,7 @@ dependencies = [
  "bytes",
  "chrono",
  "docker_credential",
+ "futures",
  "gag",
  "hostname",
  "hyper",

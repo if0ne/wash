@@ -114,6 +114,28 @@ pub trait HostApi {
         &self,
         request: WorkloadStopRequest,
     ) -> impl Future<Output = anyhow::Result<WorkloadStopResponse>>;
+    /// Start a collection of workloads on this host.
+    ///
+    /// # Arguments
+    /// * `request` - Contains the collection configuration to start
+    ///
+    /// # Returns
+    /// A `WorkloadCollectionStartResponse` with the status of all started workloads.
+    fn workload_collection_start(
+        &self,
+        request: WorkloadCollectionStartRequest,
+    ) -> impl Future<Output = anyhow::Result<WorkloadCollectionStartResponse>>;
+    /// Stop a collection of running workload on this host.
+    ///
+    /// # Arguments
+    /// * `request` - Contains the collection ID to stop
+    ///
+    /// # Returns
+    /// A `WorkloadCollectionStopResponse` with the final status of all stopped workload.
+    fn workload_collection_stop(
+        &self,
+        request: WorkloadCollectionStopRequest,
+    ) -> impl Future<Output = anyhow::Result<WorkloadCollectionStopResponse>>;
 }
 
 // Helper trait impl that helps with Arc-ing the Host
@@ -139,6 +161,25 @@ impl<T: HostApi> HostApi for Arc<T> {
     ) -> anyhow::Result<WorkloadStatusResponse> {
         self.as_ref().workload_status(request).await
     }
+    async fn workload_collection_start(
+        &self,
+        request: WorkloadCollectionStartRequest,
+    ) -> anyhow::Result<WorkloadCollectionStartResponse> {
+        self.as_ref().workload_collection_start(request).await
+    }
+    async fn workload_collection_stop(
+        &self,
+        request: WorkloadCollectionStopRequest,
+    ) -> anyhow::Result<WorkloadCollectionStopResponse> {
+        self.as_ref().workload_collection_stop(request).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HostCollection {
+    id: Arc<str>,
+    name: String,
+    workloads: HashSet<String>,
 }
 
 /// Internal representation of a workload's state within the host.
@@ -174,6 +215,8 @@ impl From<&HostWorkload> for WorkloadState {
 /// - System monitoring and resource tracking
 pub struct Host {
     engine: Engine,
+    /// Collections mapped from ID to collection of workloads
+    collection: Arc<RwLock<HashMap<Arc<str>, HostCollection>>>,
     /// Workloads mapped from ID to the workload and its current state
     workloads: Arc<RwLock<HashMap<String, HostWorkload>>>,
     /// Plugins in a map from their ID to the plugin itself
@@ -272,7 +315,7 @@ impl Host {
     }
 
     /// Helper function to generate a unique ID for a workload
-    fn generate_workload_id(&self) -> String {
+    fn generate_id(&self) -> String {
         uuid::Uuid::new_v4().to_string()
     }
 
@@ -356,6 +399,121 @@ impl Host {
         let monitor = self.system_monitor.read().await;
         Ok(monitor.cpu_usage().global_usage)
     }
+
+    async fn workload_start_impl(
+        &self,
+        collection_id: Option<Arc<str>>,
+        workload: Workload,
+    ) -> anyhow::Result<WorkloadStatus> {
+        let workload_id = self.generate_id();
+
+        // Store the workload with initial state
+        self.workloads
+            .write()
+            .await
+            .insert(workload_id.clone(), HostWorkload::Starting);
+
+        let service_present = workload.service.is_some();
+
+        // Initialize the workload using the engine, receiving the unresolved workload
+        let unresolved_workload =
+            self.engine
+                .initialize_workload(collection_id, &workload_id, workload)?;
+
+        let mut resolved_workload = unresolved_workload.resolve(Some(&self.plugins)).await?;
+
+        // If the service didn't run and we had one, warn
+        if resolved_workload.execute_service().await? != service_present {
+            warn!(
+                workload_id = %workload_id,
+                "service did not properly execute"
+            );
+        }
+
+        // Update the workload state to `Running`
+        self.workloads
+            .write()
+            .await
+            .entry(workload_id.clone())
+            .and_modify(|workload| {
+                *workload = HostWorkload::Running(Box::new(resolved_workload));
+            });
+
+        Ok(WorkloadStatus {
+            workload_id,
+            workload_state: WorkloadState::Running,
+            message: "Workload started successfully".to_string(),
+        })
+    }
+
+    async fn workload_stop_impl(
+        &self,
+        workload_id: String,
+        force: Option<bool>,
+    ) -> anyhow::Result<WorkloadStatus> {
+        let has_workload = self.workloads.read().await.contains_key(&workload_id);
+
+        let (workload_state, message) = if has_workload {
+            // Update state to stopping
+            let resolved_workload = {
+                let mut workloads = self.workloads.write().await;
+                trace!(
+                    workload_id = workload_id,
+                    "updating workload state to stopping"
+                );
+                // Insert Stopping state, extract the running workload if it was running
+                workloads
+                    .insert(workload_id.clone(), HostWorkload::Stopping)
+                    .and_then(|hw| match hw {
+                        HostWorkload::Running(rw) => Some(*rw),
+                        _ => None,
+                    })
+            };
+
+            // Stop the workload:
+            // 1. Unbind from all plugins
+            // 2. Clean up resources (drop will handle wasmtime cleanup)
+            // 3. Remove from active workloads
+            if let Some(resolved_workload) = resolved_workload {
+                debug!(
+                    workload_id = workload_id,
+                    workload_name = resolved_workload.name(),
+                    "stopping workload"
+                );
+
+                // Stop the service if running
+                resolved_workload.stop_service();
+
+                // Unbind all plugins from the workload
+                if let Err(e) = resolved_workload.unbind_all_plugins().await {
+                    warn!(
+                        workload_id = workload_id,
+                        error = ?e,
+                        "error unbinding plugins during workload stop, continuing"
+                    );
+                }
+            }
+
+            // Remove the workload from the active workloads map
+            // This will drop the workload and clean up wasmtime resources
+            self.workloads.write().await.remove(&workload_id);
+
+            debug!(workload_id = workload_id, "workload stopped successfully");
+
+            (
+                WorkloadState::Stopping,
+                "Workload stopped successfully".to_string(),
+            )
+        } else {
+            (WorkloadState::Unspecified, "Workload not found".to_string())
+        };
+
+        Ok(WorkloadStatus {
+            workload_id,
+            workload_state,
+            message,
+        })
+    }
 }
 
 impl HostApi for Host {
@@ -425,46 +583,8 @@ impl HostApi for Host {
         &self,
         request: WorkloadStartRequest,
     ) -> anyhow::Result<WorkloadStartResponse> {
-        let workload_id = self.generate_workload_id();
-
-        // Store the workload with initial state
-        self.workloads
-            .write()
-            .await
-            .insert(workload_id.clone(), HostWorkload::Starting);
-
-        let service_present = request.workload.service.is_some();
-
-        // Initialize the workload using the engine, receiving the unresolved workload
-        let unresolved_workload = self
-            .engine
-            .initialize_workload(&workload_id, request.workload)?;
-
-        let mut resolved_workload = unresolved_workload.resolve(Some(&self.plugins)).await?;
-
-        // If the service didn't run and we had one, warn
-        if resolved_workload.execute_service().await? != service_present {
-            warn!(
-                workload_id = workload_id,
-                "service did not properly execute"
-            );
-        }
-
-        // Update the workload state to `Running`
-        self.workloads
-            .write()
-            .await
-            .entry(workload_id.clone())
-            .and_modify(|workload| {
-                *workload = HostWorkload::Running(Box::new(resolved_workload));
-            });
-
         Ok(WorkloadStartResponse {
-            workload_status: WorkloadStatus {
-                workload_id,
-                workload_state: WorkloadState::Running,
-                message: "Workload started successfully".to_string(),
-            },
+            workload_status: self.workload_start_impl(None, request.workload).await?,
         })
     }
 
@@ -490,77 +610,74 @@ impl HostApi for Host {
         &self,
         request: WorkloadStopRequest,
     ) -> anyhow::Result<WorkloadStopResponse> {
-        let has_workload = self
-            .workloads
-            .read()
-            .await
-            .contains_key(&request.workload_id);
-
-        let (workload_state, message) = if has_workload {
-            // Update state to stopping
-            let resolved_workload = {
-                let mut workloads = self.workloads.write().await;
-                trace!(
-                    workload_id = request.workload_id,
-                    "updating workload state to stopping"
-                );
-                // Insert Stopping state, extract the running workload if it was running
-                workloads
-                    .insert(request.workload_id.clone(), HostWorkload::Stopping)
-                    .and_then(|hw| match hw {
-                        HostWorkload::Running(rw) => Some(*rw),
-                        _ => None,
-                    })
-            };
-
-            // Stop the workload:
-            // 1. Unbind from all plugins
-            // 2. Clean up resources (drop will handle wasmtime cleanup)
-            // 3. Remove from active workloads
-            if let Some(resolved_workload) = resolved_workload {
-                debug!(
-                    workload_id = request.workload_id,
-                    workload_name = resolved_workload.name(),
-                    "stopping workload"
-                );
-
-                // Stop the service if running
-                resolved_workload.stop_service();
-
-                // Unbind all plugins from the workload
-                if let Err(e) = resolved_workload.unbind_all_plugins().await {
-                    warn!(
-                        workload_id = request.workload_id,
-                        error = ?e,
-                        "error unbinding plugins during workload stop, continuing"
-                    );
-                }
-            }
-
-            // Remove the workload from the active workloads map
-            // This will drop the workload and clean up wasmtime resources
-            self.workloads.write().await.remove(&request.workload_id);
-
-            debug!(
-                workload_id = request.workload_id,
-                "workload stopped successfully"
-            );
-
-            (
-                WorkloadState::Stopping,
-                "Workload stopped successfully".to_string(),
-            )
-        } else {
-            (WorkloadState::Unspecified, "Workload not found".to_string())
-        };
-
         Ok(WorkloadStopResponse {
-            workload_status: WorkloadStatus {
-                workload_id: request.workload_id,
-                workload_state,
-                message,
-            },
+            workload_status: self
+                .workload_stop_impl(request.workload_id, request.force)
+                .await?,
         })
+    }
+
+    async fn workload_collection_start(
+        &self,
+        request: WorkloadCollectionStartRequest,
+    ) -> anyhow::Result<WorkloadCollectionStartResponse> {
+        let collection_id: Arc<str> = Arc::from(self.generate_id().as_str());
+
+        let handles = request
+            .workloads
+            .into_iter()
+            .map(|w| self.workload_start_impl(Some(collection_id.clone()), w));
+
+        // TODO: handle error from workloads
+        let workloads = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|w| w.ok())
+            .collect::<Vec<_>>();
+
+        self.collection.write().await.insert(
+            collection_id.clone(),
+            HostCollection {
+                id: collection_id.clone(),
+                name: request.name,
+                workloads: workloads.iter().map(|w| w.workload_id.clone()).collect(),
+            },
+        );
+
+        Ok(WorkloadCollectionStartResponse {
+            collection_id: collection_id.to_string(),
+            workload_statuses: workloads,
+        })
+    }
+
+    async fn workload_collection_stop(
+        &self,
+        request: WorkloadCollectionStopRequest,
+    ) -> anyhow::Result<WorkloadCollectionStopResponse> {
+        if let Some(collection) = self
+            .collection
+            .write()
+            .await
+            .remove(&Arc::from(request.collection_id.as_str()))
+        {
+            let handles = collection
+                .workloads
+                .into_iter()
+                .map(|id| self.workload_stop_impl(id, Some(true)));
+
+            // TODO: handle error from workloads
+            let workloads = futures::future::join_all(handles)
+                .await
+                .into_iter()
+                .filter_map(|w| w.ok())
+                .collect::<Vec<_>>();
+
+            Ok(WorkloadCollectionStopResponse {
+                workload_statuses: workloads,
+            })
+        } else {
+            anyhow::bail!("unknown collection id: {}", request.collection_id)
+        }
     }
 }
 
@@ -687,6 +804,7 @@ impl HostBuilder {
 
         Ok(Host {
             engine,
+            collection: Default::default(),
             workloads: Arc::default(),
             plugins: self.plugins,
             id: uuid::Uuid::new_v4().to_string(),

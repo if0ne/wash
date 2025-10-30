@@ -421,6 +421,7 @@ impl CliCommand for DevCommand {
         if let Err(e) = host
             .workload_stop(WorkloadStopRequest {
                 workload_id: workload_id.clone(),
+                force: None,
             })
             .await
         {
@@ -541,8 +542,11 @@ async fn reload_component(
     workload_id: Option<String>,
 ) -> anyhow::Result<String> {
     if let Some(workload_id) = workload_id {
-        host.workload_stop(WorkloadStopRequest { workload_id })
-            .await?;
+        host.workload_stop(WorkloadStopRequest {
+            workload_id,
+            force: None,
+        })
+        .await?;
     }
 
     let response = host

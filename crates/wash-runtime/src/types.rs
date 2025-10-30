@@ -185,10 +185,37 @@ pub struct WorkloadStatusResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkloadStopRequest {
     pub workload_id: String,
+    pub force: Option<bool>,
 }
 
 /// Response after attempting to stop a workload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkloadStopResponse {
     pub workload_status: WorkloadStatus,
+}
+
+/// Request to start a collection of workloads on the host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionStartRequest {
+    pub name: String,
+    pub workloads: Vec<Workload>,
+}
+
+/// Response after attempting to start a collection of workloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionStartResponse {
+    pub collection_id: String,
+    pub workload_statuses: Vec<WorkloadStatus>,
+}
+
+/// Request to stop a collection of workloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionStopRequest {
+    pub collection_id: String,
+}
+
+/// Response after attempting to stop a collection of workloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionStopResponse {
+    pub workload_statuses: Vec<WorkloadStatus>,
 }

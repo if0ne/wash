@@ -355,6 +355,8 @@ impl DerefMut for WorkloadService {
 /// state of a workload before execution.
 #[derive(Debug, Clone)]
 pub struct ResolvedWorkload {
+    /// Collection ID that run this workload
+    collection_id: Option<Arc<str>>,
     /// The unique identifier of the workload, created with [uuid::Uuid::new_v4]
     id: Arc<str>,
     /// The name of the workload
@@ -770,6 +772,11 @@ impl ResolvedWorkload {
         Ok(())
     }
 
+    /// Gets the collection id
+    pub fn collection_id(&self) -> Option<&str> {
+        self.collection_id.as_deref()
+    }
+
     /// Gets the unique identifier of the workload
     pub fn id(&self) -> &str {
         &self.id
@@ -983,6 +990,7 @@ impl ResolvedWorkload {
 /// - Validate that all dependencies can be satisfied
 /// - Create the final executable workload representation
 pub struct UnresolvedWorkload {
+    collection_id: Option<Arc<str>>,
     /// The unique identifier of the workload, created with [uuid::Uuid::new_v4]
     id: Arc<str>,
     /// The name of the workload
@@ -1012,6 +1020,7 @@ impl UnresolvedWorkload {
     /// # Returns
     /// A new `UnresolvedWorkload` ready for plugin binding and resolution.
     pub fn new(
+        collection_id: Option<Arc<str>>,
         id: impl Into<Arc<str>>,
         name: impl Into<Arc<str>>,
         namespace: impl Into<Arc<str>>,
@@ -1020,6 +1029,7 @@ impl UnresolvedWorkload {
         host_interfaces: Vec<WitInterface>,
     ) -> Self {
         Self {
+            collection_id: collection_id,
             id: id.into(),
             name: name.into(),
             namespace: namespace.into(),
@@ -1234,6 +1244,7 @@ impl UnresolvedWorkload {
 
         // Resolve the workload
         let mut resolved_workload = ResolvedWorkload {
+            collection_id: self.collection_id.clone(),
             id: self.id.clone(),
             name: self.name.clone(),
             namespace: self.namespace.clone(),
@@ -1477,6 +1488,7 @@ mod tests {
         let components = vec![create_test_component("component1")];
 
         let mut workload = UnresolvedWorkload::new(
+            None,
             "test-workload-id".to_string(),
             "test-workload".to_string(),
             "test-namespace".to_string(),
@@ -1541,6 +1553,7 @@ mod tests {
         ];
 
         let mut workload = UnresolvedWorkload::new(
+            None,
             "test-workload-id".to_string(),
             "test-workload".to_string(),
             "test-namespace".to_string(),
@@ -1594,6 +1607,7 @@ mod tests {
         let components = vec![create_test_component("component1")];
 
         let mut workload = UnresolvedWorkload::new(
+            None,
             "test-workload-id".to_string(),
             "test-workload".to_string(),
             "test-namespace".to_string(),
@@ -1639,6 +1653,7 @@ mod tests {
         // Workload requests both HTTP and Blobstore interfaces
         // But only HTTP is available via plugins
         let mut workload = UnresolvedWorkload::new(
+            None,
             "test-workload-id".to_string(),
             "test-workload".to_string(),
             "test-namespace".to_string(),
@@ -1676,6 +1691,7 @@ mod tests {
         ];
 
         let mut workload = UnresolvedWorkload::new(
+            None,
             "test-workload-id".to_string(),
             "test-workload".to_string(),
             "test-namespace".to_string(),

@@ -104,6 +104,7 @@ impl Engine {
     /// - Component initialization fails
     pub fn initialize_workload(
         &self,
+        collection_id: Option<std::sync::Arc<str>>,
         id: impl AsRef<str>,
         workload: Workload,
     ) -> anyhow::Result<UnresolvedWorkload> {
@@ -182,6 +183,7 @@ impl Engine {
         }
 
         Ok(UnresolvedWorkload::new(
+            collection_id,
             id.as_ref(),
             name,
             namespace,

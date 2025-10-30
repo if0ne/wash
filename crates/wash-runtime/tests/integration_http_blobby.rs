@@ -194,6 +194,7 @@ async fn test_blobby_integration() -> Result<()> {
     let res = host
         .workload_stop(WorkloadStopRequest {
             workload_id: workload_response.workload_status.workload_id,
+            force: None,
         })
         .await;
 
