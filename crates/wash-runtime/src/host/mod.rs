@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use names::{Generator, Name};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
@@ -81,7 +81,7 @@ pub trait HostApi {
     /// A `WorkloadStartResponse` with the status of the started workload.
     ///
     /// # Errors
-    /// Returns an error if the workload fails to start or validate.
+    /// Returns an error if an internal error occurs
     fn workload_start(
         &self,
         request: WorkloadStartRequest,
@@ -132,6 +132,9 @@ pub trait HostApi {
     ///
     /// # Returns
     /// A `WorkloadCollectionStopResponse` with the final status of all stopped workload.
+    ///
+    /// # Errors
+    /// Returns an error if the collection is not found.
     fn workload_collection_stop(
         &self,
         request: WorkloadCollectionStopRequest,
@@ -192,7 +195,7 @@ pub enum HostWorkload {
     // Boxed to reduce size of the enum
     Running(Box<ResolvedWorkload>),
     Stopping,
-    Error,
+    Error(String),
 }
 
 impl From<&HostWorkload> for WorkloadState {
@@ -201,7 +204,7 @@ impl From<&HostWorkload> for WorkloadState {
             HostWorkload::Starting => WorkloadState::Starting,
             HostWorkload::Running(_) => WorkloadState::Running,
             HostWorkload::Stopping => WorkloadState::Stopping,
-            HostWorkload::Error => WorkloadState::Error,
+            HostWorkload::Error(_) => WorkloadState::Error,
         }
     }
 }
@@ -404,53 +407,66 @@ impl Host {
         &self,
         collection_id: Option<Arc<str>>,
         workload: Workload,
-    ) -> anyhow::Result<WorkloadStatus> {
+    ) -> WorkloadStatus {
         let workload_id = self.generate_id();
 
         // Store the workload with initial state
-        self.workloads
-            .write()
-            .await
-            .insert(workload_id.clone(), HostWorkload::Starting);
+        let mut guard = self.workloads.write().await;
+        let mut entry = guard
+            .entry(workload_id.clone())
+            .insert_entry(HostWorkload::Starting);
 
         let service_present = workload.service.is_some();
 
+        let mut fail = |err: anyhow::Error| {
+            let err_msg = err.to_string();
+            *entry.get_mut() = HostWorkload::Error(err_msg.clone());
+            WorkloadStatus {
+                workload_id: workload_id.clone(),
+                workload_state: WorkloadState::Error,
+                message: err_msg,
+            }
+        };
+
         // Initialize the workload using the engine, receiving the unresolved workload
         let unresolved_workload =
-            self.engine
-                .initialize_workload(collection_id, &workload_id, workload)?;
+            match self
+                .engine
+                .initialize_workload(collection_id, &workload_id, workload)
+            {
+                Ok(workload) => workload,
+                Err(err) => return fail(err),
+            };
 
-        let mut resolved_workload = unresolved_workload.resolve(Some(&self.plugins)).await?;
+        let mut resolved_workload = match unresolved_workload.resolve(Some(&self.plugins)).await {
+            Ok(workload) => workload,
+            Err(err) => return fail(err),
+        };
 
         // If the service didn't run and we had one, warn
-        if resolved_workload.execute_service().await? != service_present {
-            warn!(
-                workload_id = %workload_id,
-                "service did not properly execute"
-            );
+        match resolved_workload.execute_service().await {
+            Ok(is_running) => {
+                if is_running != service_present {
+                    warn!(
+                        workload_id = %workload_id,
+                        "service did not properly execute"
+                    );
+                }
+            }
+            Err(err) => return fail(err),
         }
 
         // Update the workload state to `Running`
-        self.workloads
-            .write()
-            .await
-            .entry(workload_id.clone())
-            .and_modify(|workload| {
-                *workload = HostWorkload::Running(Box::new(resolved_workload));
-            });
+        *entry.get_mut() = HostWorkload::Running(Box::new(resolved_workload));
 
-        Ok(WorkloadStatus {
+        WorkloadStatus {
             workload_id,
             workload_state: WorkloadState::Running,
             message: "Workload started successfully".to_string(),
-        })
+        }
     }
 
-    async fn workload_stop_impl(
-        &self,
-        workload_id: String,
-        force: Option<bool>,
-    ) -> anyhow::Result<WorkloadStatus> {
+    async fn workload_stop_impl(&self, workload_id: String, force: Option<bool>) -> WorkloadStatus {
         let has_workload = self.workloads.read().await.contains_key(&workload_id);
 
         let (workload_state, message) = if has_workload {
@@ -508,11 +524,11 @@ impl Host {
             (WorkloadState::Unspecified, "Workload not found".to_string())
         };
 
-        Ok(WorkloadStatus {
+        WorkloadStatus {
             workload_id,
             workload_state,
             message,
-        })
+        }
     }
 }
 
@@ -526,14 +542,8 @@ impl HostApi for Host {
         }
 
         let (os_arch, os_name, os_kernel) = self.get_system_info().await;
-        let (system_memory_total, system_memory_free) = self
-            .get_memory_info()
-            .await
-            .context("failed to get memory info")?;
-        let system_cpu_usage = self
-            .get_cpu_usage()
-            .await
-            .context("failed to get CPU usage")?;
+        let (system_memory_total, system_memory_free) = self.get_memory_info().await?;
+        let system_cpu_usage = self.get_cpu_usage().await?;
 
         // Count components and providers from workloads
         let (workload_count, component_count) = {
@@ -584,7 +594,7 @@ impl HostApi for Host {
         request: WorkloadStartRequest,
     ) -> anyhow::Result<WorkloadStartResponse> {
         Ok(WorkloadStartResponse {
-            workload_status: self.workload_start_impl(None, request.workload).await?,
+            workload_status: self.workload_start_impl(None, request.workload).await,
         })
     }
 
@@ -613,7 +623,7 @@ impl HostApi for Host {
         Ok(WorkloadStopResponse {
             workload_status: self
                 .workload_stop_impl(request.workload_id, request.force)
-                .await?,
+                .await,
         })
     }
 
@@ -628,12 +638,7 @@ impl HostApi for Host {
             .into_iter()
             .map(|w| self.workload_start_impl(Some(collection_id.clone()), w));
 
-        // TODO: handle error from workloads
-        let workloads = futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .filter_map(|w| w.ok())
-            .collect::<Vec<_>>();
+        let workloads = futures::future::join_all(handles).await;
 
         self.collection.write().await.insert(
             collection_id.clone(),
@@ -665,18 +670,13 @@ impl HostApi for Host {
                 .into_iter()
                 .map(|id| self.workload_stop_impl(id, Some(true)));
 
-            // TODO: handle error from workloads
-            let workloads = futures::future::join_all(handles)
-                .await
-                .into_iter()
-                .filter_map(|w| w.ok())
-                .collect::<Vec<_>>();
+            let workloads = futures::future::join_all(handles).await;
 
             Ok(WorkloadCollectionStopResponse {
                 workload_statuses: workloads,
             })
         } else {
-            anyhow::bail!("unknown collection id: {}", request.collection_id)
+            anyhow::bail!("Collection not found: {}", request.collection_id)
         }
     }
 }
