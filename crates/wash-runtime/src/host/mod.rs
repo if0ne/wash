@@ -58,6 +58,11 @@ use crate::wit::WitWorld;
 mod sysinfo;
 use sysinfo::SystemMonitor;
 
+pub enum WorkloadStopFlavor {
+    ByUser(bool),
+    ByCollection,
+}
+
 /// The API for interacting with a wasmcloud host.
 ///
 /// This trait defines the core operations for managing workloads on a host,
@@ -466,9 +471,57 @@ impl Host {
         }
     }
 
-    async fn workload_stop_impl(&self, workload_id: String, force: Option<bool>) -> WorkloadStatus {
-        let has_workload = self.workloads.read().await.contains_key(&workload_id);
+    async fn workload_stop_impl(
+        &self,
+        workload_id: String,
+        flavor: WorkloadStopFlavor,
+    ) -> WorkloadStatus {
+        match flavor {
+            WorkloadStopFlavor::ByUser(force) => {
+                self.workload_stop_by_user(workload_id, force).await
+            }
+            WorkloadStopFlavor::ByCollection => self.workload_stop_by_collection(workload_id).await,
+        }
+    }
 
+    async fn workload_stop_by_user(&self, workload_id: String, force: bool) -> WorkloadStatus {
+        let has_collection_id = self
+            .workloads
+            .read()
+            .await
+            .get(&workload_id)
+            .map(|w| match w {
+                HostWorkload::Running(resolved_workload) => {
+                    resolved_workload.collection_id().is_some()
+                }
+                _ => false,
+            });
+
+        let has_workload = if let Some(has_collection_id) = has_collection_id {
+            if has_collection_id && !force {
+                return WorkloadStatus {
+                    workload_id,
+                    workload_state: WorkloadState::Unspecified,
+                    message:
+                        "Cannot stop workload because it belongs to a collection. Use force flag"
+                            .to_string(),
+                };
+            }
+
+            true
+        } else {
+            false
+        };
+
+        self.workload_stop_inner(workload_id, has_workload).await
+    }
+
+    async fn workload_stop_by_collection(&self, workload_id: String) -> WorkloadStatus {
+        let has_workload = self.workloads.read().await.contains_key(&workload_id);
+        self.workload_stop_inner(workload_id, has_workload).await
+    }
+
+    async fn workload_stop_inner(&self, workload_id: String, has_workload: bool) -> WorkloadStatus {
         let (workload_state, message) = if has_workload {
             // Update state to stopping
             let resolved_workload = {
@@ -622,7 +675,10 @@ impl HostApi for Host {
     ) -> anyhow::Result<WorkloadStopResponse> {
         Ok(WorkloadStopResponse {
             workload_status: self
-                .workload_stop_impl(request.workload_id, request.force)
+                .workload_stop_impl(
+                    request.workload_id,
+                    WorkloadStopFlavor::ByUser(request.force.unwrap_or_default()),
+                )
                 .await,
         })
     }
@@ -668,7 +724,7 @@ impl HostApi for Host {
             let handles = collection
                 .workloads
                 .into_iter()
-                .map(|id| self.workload_stop_impl(id, Some(true)));
+                .map(|id| self.workload_stop_impl(id, WorkloadStopFlavor::ByCollection));
 
             let workloads = futures::future::join_all(handles).await;
 

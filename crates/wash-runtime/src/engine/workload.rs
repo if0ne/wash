@@ -1029,7 +1029,7 @@ impl UnresolvedWorkload {
         host_interfaces: Vec<WitInterface>,
     ) -> Self {
         Self {
-            collection_id: collection_id,
+            collection_id,
             id: id.into(),
             name: name.into(),
             namespace: namespace.into(),
