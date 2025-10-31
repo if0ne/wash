@@ -157,6 +157,14 @@ pub struct WorkloadStatus {
     pub message: String,
 }
 
+/// Information about a collection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionInfo {
+    pub collection_id: String,
+    pub name: String,
+    pub workloads: Vec<String>,
+}
+
 /// Request to start a new workload on the host.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkloadStartRequest {
@@ -218,4 +226,16 @@ pub struct WorkloadCollectionStopRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkloadCollectionStopResponse {
     pub workload_statuses: Vec<WorkloadStatus>,
+}
+
+/// Request to get info of a specific collection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionInfoRequest {
+    pub collection_id: String,
+}
+
+/// Response containing info of a requested collection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadCollectionInfoResponse {
+    pub info: WorkloadCollectionInfo,
 }

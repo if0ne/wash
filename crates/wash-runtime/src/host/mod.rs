@@ -130,6 +130,20 @@ pub trait HostApi {
         &self,
         request: WorkloadCollectionStartRequest,
     ) -> impl Future<Output = anyhow::Result<WorkloadCollectionStartResponse>>;
+    /// Query the info of a collection.
+    ///
+    /// # Arguments
+    /// * `request` - Contains the collection ID to query
+    ///
+    /// # Returns
+    /// A `WorkloadCollectionInfoResponse` with the info of the collection.
+    ///
+    /// # Errors
+    /// Returns an error if the collection is not found.
+    fn workload_collection_info(
+        &self,
+        request: WorkloadCollectionInfoRequest,
+    ) -> impl Future<Output = anyhow::Result<WorkloadCollectionInfoResponse>>;
     /// Stop a collection of running workload on this host.
     ///
     /// # Arguments
@@ -175,6 +189,12 @@ impl<T: HostApi> HostApi for Arc<T> {
     ) -> anyhow::Result<WorkloadCollectionStartResponse> {
         self.as_ref().workload_collection_start(request).await
     }
+    async fn workload_collection_info(
+        &self,
+        request: WorkloadCollectionInfoRequest,
+    ) -> anyhow::Result<WorkloadCollectionInfoResponse> {
+        self.as_ref().workload_collection_info(request).await
+    }
     async fn workload_collection_stop(
         &self,
         request: WorkloadCollectionStopRequest,
@@ -185,6 +205,7 @@ impl<T: HostApi> HostApi for Arc<T> {
 
 #[derive(Debug, Clone)]
 pub struct HostCollection {
+    #[allow(dead_code)]
     id: Arc<str>,
     name: String,
     workloads: HashSet<String>,
@@ -709,6 +730,28 @@ impl HostApi for Host {
             collection_id: collection_id.to_string(),
             workload_statuses: workloads,
         })
+    }
+
+    async fn workload_collection_info(
+        &self,
+        request: WorkloadCollectionInfoRequest,
+    ) -> anyhow::Result<WorkloadCollectionInfoResponse> {
+        if let Some(collection) = self
+            .collection
+            .write()
+            .await
+            .get(&Arc::from(request.collection_id.as_str()))
+        {
+            Ok(WorkloadCollectionInfoResponse {
+                info: WorkloadCollectionInfo {
+                    collection_id: request.collection_id,
+                    name: collection.name.clone(),
+                    workloads: collection.workloads.iter().cloned().collect::<Vec<_>>(),
+                },
+            })
+        } else {
+            anyhow::bail!("Collection not found: {}", request.collection_id)
+        }
     }
 
     async fn workload_collection_stop(
