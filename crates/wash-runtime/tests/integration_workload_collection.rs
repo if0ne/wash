@@ -28,7 +28,7 @@ use wash_runtime::{
 const HTTP_KEYVALUE_COUNTER_WASM: &[u8] = include_bytes!("fixtures/http_keyvalue_counter.wasm");
 
 #[tokio::test]
-async fn test_http_keyvalue_counter_integration() -> Result<()> {
+async fn test_workload_collection_integration() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -331,6 +331,139 @@ async fn test_http_keyvalue_counter_integration() -> Result<()> {
     println!("http_keyvalue_counter.wasm component responded successfully to all requests");
     println!("HTTP and keyvalue plugins are working together with counter component");
     println!("Keyvalue counter integration test passed!");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stress_test_workload_collection() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    println!("Starting http_keyvalue_counter.wasm integration test");
+
+    // Create engine
+    let engine = Engine::builder().build()?;
+
+    // Create HTTP server plugin on a dynamically allocated port
+    let port = find_available_port().await?;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let http_plugin = HttpServer::new(addr);
+
+    // Create keyvalue plugin
+    let keyvalue_plugin = WasiKeyvalue::new();
+
+    // Create blobstore plugin
+    let blobstore_plugin = WasiBlobstore::new(None);
+
+    // Create config plugin
+    let config_plugin = RuntimeConfig::default();
+
+    // Create logging plugin
+    let logging_plugin = WasiLogging {};
+
+    // Build host with plugins
+    let host = HostBuilder::new()
+        .with_engine(engine.clone())
+        .with_plugin(Arc::new(http_plugin))?
+        .with_plugin(Arc::new(keyvalue_plugin))?
+        .with_plugin(Arc::new(blobstore_plugin))?
+        .with_plugin(Arc::new(config_plugin))?
+        .with_plugin(Arc::new(logging_plugin))?
+        .build()?;
+
+    println!("Created host with HTTP and keyvalue plugins for counter test");
+
+    // Start the host
+    let host = host.start().await.context("Failed to start host")?;
+    println!("Host started, HTTP server listening on {addr}");
+
+    // Create a workload request with the counter component
+    let req = WorkloadCollectionStartRequest {
+        name: "mock".to_string(),
+        workloads: (0..16)
+            .map(|i| Workload {
+                namespace: "test".to_string(),
+                name: "keyvalue-counter-workload".to_string(),
+                annotations: HashMap::new(),
+                service: None,
+                components: vec![Component {
+                    bytes: bytes::Bytes::from_static(HTTP_KEYVALUE_COUNTER_WASM),
+                    local_resources: LocalResources {
+                        memory_limit_mb: 256,
+                        cpu_limit: 1,
+                        config: HashMap::new(),
+                        environment: HashMap::new(),
+                        volume_mounts: vec![],
+                        allowed_hosts: vec![],
+                    },
+                    pool_size: 1,
+                    max_invocations: 100,
+                }],
+                host_interfaces: vec![
+                    WitInterface {
+                        namespace: "wasi".to_string(),
+                        package: "http".to_string(),
+                        interfaces: ["incoming-handler".to_string()].into_iter().collect(),
+                        version: Some(semver::Version::parse("0.2.2").unwrap()),
+                        config: {
+                            let mut config = HashMap::new();
+                            config.insert("host".to_string(), format!("keyvalue-counter-{i}"));
+                            config
+                        },
+                    },
+                    WitInterface {
+                        namespace: "wasi".to_string(),
+                        package: "keyvalue".to_string(),
+                        interfaces: ["store".to_string(), "atomics".to_string()]
+                            .into_iter()
+                            .collect(),
+                        version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
+                        config: HashMap::new(),
+                    },
+                    WitInterface {
+                        namespace: "wasi".to_string(),
+                        package: "blobstore".to_string(),
+                        interfaces: ["blobstore".to_string()].into_iter().collect(),
+                        version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
+                        config: HashMap::new(),
+                    },
+                    WitInterface {
+                        namespace: "wasi".to_string(),
+                        package: "config".to_string(),
+                        interfaces: ["runtime".to_string()].into_iter().collect(),
+                        version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
+                        config: HashMap::new(),
+                    },
+                    WitInterface {
+                        namespace: "wasi".to_string(),
+                        package: "logging".to_string(),
+                        interfaces: ["logging".to_string()].into_iter().collect(),
+                        version: Some(semver::Version::parse("0.1.0-draft").unwrap()),
+                        config: HashMap::new(),
+                    },
+                ],
+                volumes: vec![],
+            })
+            .collect(),
+    };
+
+    let time = std::time::Instant::now();
+    // Start the workload
+    let workload_response = host
+        .workload_collection_start(req)
+        .await
+        .context("Failed to start keyvalue counter workload")?;
+    println!(
+        "Started collection: {:?}. Elapsed time: {:?}",
+        workload_response.collection_id,
+        time.elapsed()
+    );
+
+    for (idx, workload) in workload_response.workload_statuses.iter().enumerate() {
+        println!("Started workload {idx}: {workload:?}");
+    }
 
     Ok(())
 }
