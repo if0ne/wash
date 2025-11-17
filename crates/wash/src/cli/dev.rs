@@ -408,7 +408,10 @@ impl CliCommand for DevCommand {
         let _ = reload_rx.try_recv();
 
         info!("development session started successfully");
-        info!(address = %format!("{}://{}", protocol.unwrap_or("<unknown>"), self.address), "listening for HTTP requests");
+
+        if let Some(protocol) = protocol {
+            info!(address = %format!("{protocol}://{}", self.address), "listening for HTTP requests");
+        }
 
         loop {
             info!("watching for file changes (press Ctrl+c to stop)...");
