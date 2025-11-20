@@ -22,7 +22,10 @@ use tracing::{debug, error, info, trace, warn};
 use wash_runtime::plugin::wasi_webgpu::WasiWebGpu;
 use wash_runtime::{
     host::{Host, HostApi},
-    plugin::{wasi_config::WasiConfig, wasi_http::HttpServer, wasi_logging::WasiLogging},
+    plugin::{
+        wasi_blobstore::WasiBlobstore, wasi_config::WasiConfig, wasi_http::HttpServer,
+        wasi_keyvalue::WasiKeyvalue, wasi_logging::WasiLogging,
+    },
     types::{
         Component, HostPathVolume, LocalResources, Volume, VolumeMount, VolumeType, Workload,
         WorkloadStartRequest, WorkloadState, WorkloadStopRequest,
@@ -38,6 +41,7 @@ use crate::{
     },
     component_build::BuildConfig,
     config::{Config, load_config},
+    inspect::decode_component,
     plugin::bindings::wasmcloud::wash::types::HookType,
 };
 
@@ -58,11 +62,6 @@ pub struct DevCommand {
     /// Configuration values to use for `wasi:config/store` in the form of `key=value` pairs.
     #[clap(long = "wasi-config", value_delimiter = ',')]
     pub wasi_config: Vec<String>,
-
-    /// Enable WASI WebGPU support
-    #[cfg(not(target_os = "windows"))]
-    #[clap(long = "wasi-webgpu", default_value_t = false)]
-    pub wasi_webgpu: bool,
 
     // TODO: filesystem root?
     /// The root directory for the blobstore to use for `wasi:blobstore/blobstore`. Defaults to a subfolder in the wash data directory.
@@ -179,10 +178,100 @@ impl CliCommand for DevCommand {
             dev_register_components.push(plugin.get_original_component(ctx).await?)
         }
 
-        let mut host_builder = Host::builder();
+        let mut protocol = None;
+        let host_builder = {
+            let cursor = std::io::Cursor::new(&wasm_bytes);
+            let decoded_wasm = decode_component(cursor)
+                .await
+                .context("failed to decode component")?;
 
-        // Enable wasi config
-        host_builder = host_builder.with_plugin(Arc::new(WasiConfig::default()))?;
+            let mut builder = Host::builder();
+
+            let imports = decoded_wasm
+                .resolve()
+                .package_names
+                .keys()
+                .filter_map(|name| {
+                    if name.namespace == "wasi" {
+                        Some(&name.name)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<HashSet<_>>();
+
+            for import in imports {
+                match import.as_str() {
+                    "config" => {
+                        builder = builder.with_plugin(Arc::new(WasiConfig::default()))?;
+                        debug!("Config plugin registered");
+                    }
+                    "logging" => {
+                        builder = builder.with_plugin(Arc::new(WasiLogging))?;
+                        debug!("Logging plugin registered");
+                    }
+                    "keyvalue" => {
+                        builder = builder.with_plugin(Arc::new(WasiKeyvalue::default()))?;
+                        debug!("Logging plugin registered");
+                    }
+                    "blobstore" => {
+                        builder = builder.with_plugin(Arc::new(WasiBlobstore::default()))?;
+                        debug!("Logging plugin registered");
+                    }
+                    "http" => {
+                        if let (Some(cert_path), Some(key_path)) = (&self.tls_cert, &self.tls_key) {
+                            ensure!(
+                                cert_path.exists(),
+                                "TLS certificate file does not exist: {}",
+                                cert_path.display()
+                            );
+                            ensure!(
+                                key_path.exists(),
+                                "TLS private key file does not exist: {}",
+                                key_path.display()
+                            );
+
+                            if let Some(ca_path) = &self.tls_ca {
+                                ensure!(
+                                    ca_path.exists(),
+                                    "CA certificate file does not exist: {}",
+                                    ca_path.display()
+                                );
+                            }
+
+                            builder = builder.with_plugin(Arc::new(
+                                HttpServer::new_with_tls(
+                                    self.address.parse()?,
+                                    cert_path,
+                                    key_path,
+                                    self.tls_ca.as_deref(),
+                                )
+                                .await?,
+                            ))?;
+
+                            debug!("TLS configured - server will use HTTPS");
+                            protocol = Some("https");
+                        } else {
+                            debug!("No TLS configuration provided - server will use HTTP");
+                            builder = builder
+                                .with_plugin(Arc::new(HttpServer::new(self.address.parse()?)))?;
+                            protocol = Some("http");
+                        };
+                    }
+                    "webgpu" => {
+                        // Enable WASI WebGPU if requested
+                        #[cfg(not(target_os = "windows"))]
+                        if true {
+                            builder = builder.with_plugin(Arc::new(WasiWebGpu::default()))?;
+                            debug!("WASI WebGPU plugin registered");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            builder
+        };
 
         let volume_root = self
             .blobstore_root
@@ -195,58 +284,6 @@ impl CliCommand for DevCommand {
                 .context("failed to create blobstore root directory")?;
         }
         debug!(path = ?volume_root.display(), "using blobstore root directory");
-
-        // TODO(#19): Only spawn the server if the component exports wasi:http
-        // Configure HTTP server with optional TLS, enable HTTP Server
-        let protocol = if let (Some(cert_path), Some(key_path)) = (&self.tls_cert, &self.tls_key) {
-            ensure!(
-                cert_path.exists(),
-                "TLS certificate file does not exist: {}",
-                cert_path.display()
-            );
-            ensure!(
-                key_path.exists(),
-                "TLS private key file does not exist: {}",
-                key_path.display()
-            );
-
-            if let Some(ca_path) = &self.tls_ca {
-                ensure!(
-                    ca_path.exists(),
-                    "CA certificate file does not exist: {}",
-                    ca_path.display()
-                );
-            }
-
-            host_builder = host_builder.with_plugin(Arc::new(
-                HttpServer::new_with_tls(
-                    self.address.parse()?,
-                    cert_path,
-                    key_path,
-                    self.tls_ca.as_deref(),
-                )
-                .await?,
-            ))?;
-
-            debug!("TLS configured - server will use HTTPS");
-            "https"
-        } else {
-            debug!("No TLS configuration provided - server will use HTTP");
-            host_builder =
-                host_builder.with_plugin(Arc::new(HttpServer::new(self.address.parse()?)))?;
-            "http"
-        };
-
-        // Add logging plugin
-        host_builder = host_builder.with_plugin(Arc::new(WasiLogging))?;
-        debug!("Logging plugin registered");
-
-        // Enable WASI WebGPU if requested
-        #[cfg(not(target_os = "windows"))]
-        if self.wasi_webgpu {
-            host_builder = host_builder.with_plugin(Arc::new(WasiWebGpu::default()))?;
-            debug!("WASI WebGPU plugin registered");
-        }
 
         // Build and start the host
         let host = host_builder.build()?.start().await?;
@@ -371,7 +408,10 @@ impl CliCommand for DevCommand {
         let _ = reload_rx.try_recv();
 
         info!("development session started successfully");
-        info!(address = %format!("{}://{}", protocol, self.address), "listening for HTTP requests");
+
+        if let Some(protocol) = protocol {
+            info!(address = %format!("{protocol}://{}", self.address), "listening for HTTP requests");
+        }
 
         loop {
             info!("watching for file changes (press Ctrl+c to stop)...");
