@@ -188,6 +188,7 @@ pub struct Host {
     /// System monitor for tracking CPU/memory usage
     system_monitor: Arc<RwLock<SystemMonitor>>,
     // endpoints: HashMap<String, EndpointConfiguration>
+    config: HostConfig,
 }
 
 impl Host {
@@ -261,6 +262,14 @@ impl Host {
     /// The host's unique ID string.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Get host config
+    ///
+    /// # Returns
+    /// The host's config
+    pub fn config(&self) -> &HostConfig {
+        &self.config
     }
 
     /// Get the human-readable name for this host.
@@ -571,6 +580,12 @@ impl std::fmt::Debug for Host {
     }
 }
 
+/// Config for the [`Host`]
+#[derive(Clone, Debug, Default)]
+pub struct HostConfig {
+    pub allow_oci_insecure: bool,
+}
+
 /// Builder for the [`Host`]
 #[derive(Default)]
 pub struct HostBuilder {
@@ -579,6 +594,7 @@ pub struct HostBuilder {
     hostname: Option<String>,
     friendly_name: Option<String>,
     labels: HashMap<String, String>,
+    config: Option<HostConfig>,
 }
 
 impl HostBuilder {
@@ -644,6 +660,11 @@ impl HostBuilder {
         self
     }
 
+    pub fn with_config(mut self, config: HostConfig) -> Self {
+        self.config.replace(config);
+        self
+    }
+
     /// Builds and returns a configured [`Host`].
     ///
     /// This method finalizes the configuration and creates the host.
@@ -689,6 +710,7 @@ impl HostBuilder {
             labels: self.labels,
             started_at: chrono::Utc::now(),
             system_monitor: Arc::new(RwLock::new(SystemMonitor::new())),
+            config: self.config.unwrap_or_default(),
         })
     }
 }
