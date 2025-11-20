@@ -606,6 +606,7 @@ impl Default for HostBuilder {
             hostname: Default::default(),
             friendly_name: Default::default(),
             labels: Default::default(),
+            config: Default::default(),
         }
     }
 }
