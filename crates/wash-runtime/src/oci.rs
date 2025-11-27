@@ -42,7 +42,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 #[allow(deprecated)]
 #[deprecated = "old media type used before Wasm WG standardization"]
@@ -168,7 +168,6 @@ impl CacheManager {
 
     /// Read cached artifact, returning (component_data, digest)
     async fn read_cached(&self, reference: &str) -> Result<(Vec<u8>, String)> {
-        info!(reference = %reference, "reading cached artifact instead of pulling");
         let component_path = self.get_component_path(reference);
         let digest_path = self.get_digest_path(reference);
 
@@ -321,31 +320,9 @@ impl CredentialResolver {
 /// ```
 #[instrument(skip(config), fields(reference = %reference))]
 pub async fn pull_component(reference: &str, config: OciConfig) -> Result<(Vec<u8>, String)> {
-    info!(reference = %reference, "Pulling component");
-
     // Parse OCI reference
     let reference_parsed = Reference::try_from(reference)
         .with_context(|| format!("invalid OCI reference: {reference}"))?;
-
-    // Initialize cache manager
-    let cache_manager = config
-        .cache_dir
-        .as_ref()
-        .map(|dir| CacheManager::new(dir.clone()));
-    if let Some(cache_manager) = &cache_manager {
-        // Check cache first
-        if cache_manager.is_cached(reference).await {
-            debug!("Found cached artifact");
-            let (component_data, digest) = cache_manager.read_cached(reference).await?;
-            return Ok((component_data, digest));
-        }
-    }
-
-    // Setup credential resolver
-    let credential_resolver = CredentialResolver::new(config.credentials);
-    let auth = credential_resolver
-        .resolve_credentials(reference_parsed.registry())
-        .await;
 
     // Configure OCI client
     let client_config = ClientConfig {
@@ -358,6 +335,35 @@ pub async fn pull_component(reference: &str, config: OciConfig) -> Result<(Vec<u
     };
 
     let client = Client::new(client_config);
+
+    // Setup credential resolver
+    let credential_resolver = CredentialResolver::new(config.credentials);
+    let auth = credential_resolver
+        .resolve_credentials(reference_parsed.registry())
+        .await;
+
+    // Initialize cache manager
+    let cache_manager = config
+        .cache_dir
+        .as_ref()
+        .map(|dir| CacheManager::new(dir.clone()));
+    if let Some(cache_manager) = &cache_manager {
+        // Check cache first
+        if cache_manager.is_cached(reference).await {
+            debug!("Found cached artifact");
+            let (component_data, digest) = cache_manager.read_cached(reference).await?;
+
+            let fetched_digest = client
+                .fetch_manifest_digest(&reference_parsed, &auth)
+                .await?;
+
+            if digest == fetched_digest {
+                return Ok((component_data, digest));
+            }
+
+            debug!("Cached artifact expired; pulling new component version");
+        }
+    }
 
     // Pull the component using oci-client
     let pull_future = client.pull(
@@ -411,7 +417,6 @@ pub async fn pull_component(reference: &str, config: OciConfig) -> Result<(Vec<u
             .with_context(|| "failed to cache component")?;
     }
 
-    info!(size = component_data.len(), digest = %digest, "Successfully pulled component");
     Ok((component_data, digest))
 }
 
@@ -463,12 +468,6 @@ pub async fn push_component(
     config: OciConfig,
     annotations: Option<HashMap<String, String>>,
 ) -> Result<String> {
-    info!(
-        reference = %reference,
-        size = component_data.len(),
-        "pushing component"
-    );
-
     // Parse OCI reference
     let reference_parsed = Reference::try_from(reference)
         .with_context(|| format!("invalid OCI reference: {reference}"))?;
@@ -581,7 +580,6 @@ pub async fn push_component(
             .with_context(|| "failed to cache pushed component")?;
     }
 
-    info!(digest = %digest, "successfully pushed component");
     Ok(digest)
 }
 

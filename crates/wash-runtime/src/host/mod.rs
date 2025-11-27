@@ -43,6 +43,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use names::{Generator, Name};
@@ -275,6 +276,30 @@ impl Host {
     /// The host's unique ID string.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Get the system hostname for this host.
+    ///
+    /// # Returns
+    /// The host's system hostname string.
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// Get all labels assigned to this host.
+    ///
+    /// # Returns
+    /// A reference to the host's labels map.
+    pub fn labels(&self) -> &HashMap<String, String> {
+        &self.labels
+    }
+
+    /// Get the version of this host.
+    ///
+    /// # Returns
+    /// The host's version string.
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     /// Get host config
@@ -597,9 +622,19 @@ impl std::fmt::Debug for Host {
 }
 
 /// Config for the [`Host`]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HostConfig {
     pub allow_oci_insecure: bool,
+    pub oci_pull_timeout: Option<Duration>,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            allow_oci_insecure: false,
+            oci_pull_timeout: Duration::from_secs(30).into(),
+        }
+    }
 }
 
 /// Builder for the [`Host`]

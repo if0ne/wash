@@ -12,6 +12,7 @@ use opentelemetry_sdk::resource::{Resource, ResourceBuilder};
 use opentelemetry_semantic_conventions::resource;
 use sysinfo::System;
 use tokio::sync::oneshot;
+use tracing::{debug, info};
 
 pub mod plugins;
 
@@ -35,6 +36,7 @@ pub struct ClusterHostBuilder {
     host_group: Option<String>,
     host_name: Option<String>,
     heartbeat_interval: Option<Duration>,
+    host_config: Option<HostConfig>,
 }
 
 impl ClusterHostBuilder {
@@ -45,6 +47,11 @@ impl ClusterHostBuilder {
 
     pub fn with_host_name(mut self, host_name: impl AsRef<str>) -> Self {
         self.host_name = Some(host_name.as_ref().into());
+        self
+    }
+
+    pub fn with_host_config(mut self, host_config: HostConfig) -> Self {
+        self.host_config = Some(host_config);
         self
     }
 
@@ -86,6 +93,11 @@ impl ClusterHostBuilder {
         if let Some(host_name) = self.host_name {
             builder = builder.with_hostname(host_name)
         }
+
+        if let Some(host_config) = self.host_config {
+            builder = builder.with_config(host_config);
+        }
+
         let heartbeat_interval = self.heartbeat_interval.unwrap_or(HEARTBEAT_INTERVAL);
         let host = builder.build()?;
         Ok(ClusterHost {
@@ -144,6 +156,14 @@ pub async fn run_cluster_host(
     let heartbeat_interval = cluster_host.heartbeat_interval;
     let host_id = host.id().to_string();
     let host_clone = host.clone();
+
+    info!(
+        host_id=?host_id,
+        friendly_name=?host.friendly_name(),
+        host_name=?host.hostname(),
+        labels=?host.labels(),
+        version=?host.version(),
+        "Host started");
 
     let task = tokio::task::spawn(async move {
         let host_subject = host_subject(host_id.as_ref());
@@ -268,12 +288,17 @@ async fn handle_command(
 
 /// Convert ImagePullSecret from protobuf to OciConfig
 fn image_pull_secret_to_oci_config(
+    config: &HostConfig,
     pull_secret: &Option<types::v2::ImagePullSecret>,
 ) -> oci::OciConfig {
-    match &pull_secret {
+    let mut oci_config = match &pull_secret {
         Some(creds) => oci::OciConfig::new_with_credentials(&creds.username, &creds.password),
         None => OciConfig::default(),
-    }
+    };
+    oci_config.insecure = config.allow_oci_insecure;
+    oci_config.timeout = config.oci_pull_timeout;
+
+    oci_config
 }
 
 async fn host_heartbeat(host: &impl HostApi) -> anyhow::Result<types::v2::HostHeartbeat> {
@@ -298,11 +323,11 @@ async fn workload_start(
     else {
         anyhow::bail!("workload is required");
     };
+
     let (components, host_interfaces) = if let Some(wit_world) = wit_world {
         let mut pulled_components = Vec::with_capacity(wit_world.components.len());
         for component in &wit_world.components {
-            let mut oci_config = image_pull_secret_to_oci_config(&component.image_pull_secret);
-            oci_config.insecure = config.allow_oci_insecure;
+            let oci_config = image_pull_secret_to_oci_config(config, &component.image_pull_secret);
             let bytes = match oci::pull_component(&component.image, oci_config).await {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -342,7 +367,7 @@ async fn workload_start(
     };
 
     let service = if let Some(service) = service {
-        let oci_config = image_pull_secret_to_oci_config(&service.image_pull_secret);
+        let oci_config = image_pull_secret_to_oci_config(config, &service.image_pull_secret);
         let bytes = match oci::pull_component(&service.image, oci_config).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -383,6 +408,12 @@ async fn workload_start(
         },
     };
 
+    info!(
+        worload_id=?request.workload_id,
+        namespace=?request.workload.namespace,
+        name=?request.workload.name,
+        "Starting workload");
+
     Ok(host.workload_start(request).await?.into())
 }
 
@@ -390,6 +421,10 @@ async fn workload_stop(
     host: &impl HostApi,
     req: types::v2::WorkloadStopRequest,
 ) -> anyhow::Result<types::v2::WorkloadStopResponse> {
+    info!(
+        worload_id=?req.workload_id,
+        "Stopping workload");
+
     host.workload_stop(req.into()).await.map(|resp| resp.into())
 }
 
@@ -397,6 +432,10 @@ async fn workload_status(
     host: &impl HostApi,
     req: types::v2::WorkloadStatusRequest,
 ) -> anyhow::Result<types::v2::WorkloadStatusResponse> {
+    debug!(
+        worload_id=?req.workload_id,
+        "Fetching workload status");
+
     host.workload_status(req.into())
         .await
         .map(|resp| resp.into())
@@ -427,7 +466,7 @@ pub fn resource_builder() -> ResourceBuilder {
     Resource::builder()
         .with_attribute(KeyValue::new(
             resource::SERVICE_NAME.to_string(),
-            "control-host",
+            "wash-host",
         ))
         .with_attribute(KeyValue::new(
             resource::SERVICE_INSTANCE_ID.to_string(),
@@ -602,8 +641,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_image_pull_secret_to_oci_config_none() {
+        let host_config = HostConfig {
+            allow_oci_insecure: false,
+            oci_pull_timeout: None,
+        };
         let secret: Option<types::v2::ImagePullSecret> = None;
-        let config = image_pull_secret_to_oci_config(&secret);
+        let config = image_pull_secret_to_oci_config(&host_config, &secret);
         assert!(config.credentials.is_none());
         assert!(!config.insecure);
     }
@@ -615,7 +658,11 @@ mod tests {
             password: "testpass".to_string(),
         });
 
-        let config = image_pull_secret_to_oci_config(&secret);
+        let host_config = HostConfig {
+            allow_oci_insecure: false,
+            oci_pull_timeout: None,
+        };
+        let config = image_pull_secret_to_oci_config(&host_config, &secret);
         assert_eq!(
             config.credentials,
             Some(("testuser".to_string(), "testpass".to_string()))
